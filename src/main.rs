@@ -6,7 +6,9 @@
 //! single Feishu card (once per symbol per list). The list itself is rebuilt
 //! every REFRESH_SECS from a simplified self-contained short score.
 //!
-//! PUSH_FEISHU=1 enables real pushes; anything else is shadow (log only).
+//! PUSH_FEISHU=1 enables dump-alert pushes; anything else is shadow (log only).
+//! PUSH_RANK_FEISHU=1 enables the hourly short-rank Feishu card; default 0
+//! keeps it in shadow (log the card body, do not POST).
 
 use chrono::{Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,33 @@ fn shanghai_naive_today() -> NaiveDate {
 // ---- env / logging ----
 fn push_feishu_enabled() -> bool {
     std::env::var("PUSH_FEISHU").unwrap_or_else(|_| "0".into()) == "1"
+}
+
+fn push_rank_feishu_enabled() -> bool {
+    std::env::var("PUSH_RANK_FEISHU").unwrap_or_else(|_| "0".into()) == "1"
+}
+
+fn shanghai_hour_key() -> String {
+    Utc::now().with_timezone(&tz()).format("%Y-%m-%d-%H").to_string()
+}
+
+fn shanghai_now_hm() -> String {
+    Utc::now().with_timezone(&tz()).format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn last_rank_hour_path() -> PathBuf {
+    data_dir().join("last_rank_push_hour.txt")
+}
+
+fn load_last_rank_hour() -> Option<String> {
+    fs::read_to_string(last_rank_hour_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_last_rank_hour(key: &str) {
+    atomic_write(&last_rank_hour_path(), &format!("{key}\n"));
 }
 
 fn data_dir() -> PathBuf {
@@ -338,7 +367,20 @@ fn load_watchlist() -> Option<WatchList> {
 }
 
 // ---- scoring: build the short list from public data ----
-fn score_symbol(t: &Ticker) -> Option<(String, i32)> {
+#[derive(Debug, Clone)]
+struct ScoreDetail {
+    symbol: String,
+    short_score: i32,
+    pct: f64,
+    premium: f64,
+    peak_gap_pct: f64,
+    dist_high_pct: f64,
+    atr_expansion: f64,
+    atr_pct: f64,
+    bear_5m: bool,
+}
+
+fn score_symbol(t: &Ticker) -> Option<ScoreDetail> {
     let bars4h = fetch_klines(&t.symbol, "4h", 100);
     let bars5m = fetch_klines(&t.symbol, "5m", 150);
     let bars1h = fetch_klines(&t.symbol, "1h", 60);
@@ -364,7 +406,17 @@ fn score_symbol(t: &Ticker) -> Option<(String, i32)> {
     };
     let bear = core::bearish_5m(&bars5m, 3);
     let score = core::short_score(t.price_change_percent, premium, gap, dist_high, atr_expansion, bear);
-    Some((t.symbol.clone(), score))
+    Some(ScoreDetail {
+        symbol: t.symbol.clone(),
+        short_score: score,
+        pct: t.price_change_percent,
+        premium,
+        peak_gap_pct: gap,
+        dist_high_pct: dist_high,
+        atr_expansion,
+        atr_pct: atr_recent,
+        bear_5m: bear,
+    })
 }
 
 fn refresh_watchlist(prices_now: &HashMap<String, f64>) -> Option<WatchList> {
@@ -375,29 +427,29 @@ fn refresh_watchlist(prices_now: &HashMap<String, f64>) -> Option<WatchList> {
     }
     let cands = core::pick_candidates(&tickers, core::CANDIDATES);
     log_line(&format!("REFRESH candidates={}", cands.len()));
-    let mut scored: Vec<(String, i32)> = Vec::new();
+    let mut scored: Vec<ScoreDetail> = Vec::new();
     for t in &cands {
         if let Some(s) = score_symbol(t) {
             scored.push(s);
         }
     }
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by(|a, b| b.short_score.cmp(&a.short_score));
     // Drop non-crypto tokens (stock / leveraged ETF) using the CoinGecko
     // market-cap list, exactly like the original short_rank does.
     let ranks = mcap::load_ranks();
     let before = scored.len();
-    let scored: Vec<(String, i32)> = if ranks.is_empty() {
+    let scored: Vec<ScoreDetail> = if ranks.is_empty() {
         // CoinGecko unreachable: fall back to the static stock/ETF blacklist so
         // the monitor keeps working instead of collapsing to an empty list.
         log_line("REFRESH coingecko empty, using non-crypto blacklist fallback");
         scored
             .into_iter()
-            .filter(|(sym, _)| !mcap::is_non_crypto_base(sym))
+            .filter(|s| !mcap::is_non_crypto_base(&s.symbol))
             .collect()
     } else {
         scored
             .into_iter()
-            .filter(|(sym, _)| mcap::is_listed(&ranks, sym))
+            .filter(|s| mcap::is_listed(&ranks, &s.symbol))
             .collect()
     };
     log_line(&format!("REFRESH mcap filter {} -> {} (ranks={})", before, scored.len(), ranks.len()));
@@ -405,26 +457,41 @@ fn refresh_watchlist(prices_now: &HashMap<String, f64>) -> Option<WatchList> {
         log_line("REFRESH produced empty list, keeping previous watchlist");
         return None;
     }
-    let top = scored.into_iter().take(core::TOP_N).collect::<Vec<_>>();
+    let top: Vec<ScoreDetail> = scored.into_iter().take(core::TOP_N).collect();
     let now = unix_now();
     let expires = now + core::WATCH_SECS;
     let mut rows = Vec::new();
     let mut skipped = Vec::new();
-    for (sym, sc) in &top {
-        let px = prices_now.get(sym).copied().or_else(|| {
-            fetch_price_map(std::slice::from_ref(sym)).get(sym).copied()
+    let mut rank_rows: Vec<core::RankRow> = Vec::new();
+    for s in &top {
+        let px = prices_now.get(&s.symbol).copied().or_else(|| {
+            fetch_price_map(std::slice::from_ref(&s.symbol)).get(&s.symbol).copied()
         });
         match px {
-            Some(p) if p > 0.0 => rows.push(SymRow {
-                symbol: sym.clone(),
-                baseline: p,
-                short_score: Some(*sc),
-                alerted: false,
-                alerted_at: None,
-                alert_drop_pct: None,
-                alert_price: None,
-            }),
-            _ => skipped.push(sym.clone()),
+            Some(p) if p > 0.0 => {
+                rows.push(SymRow {
+                    symbol: s.symbol.clone(),
+                    baseline: p,
+                    short_score: Some(s.short_score),
+                    alerted: false,
+                    alerted_at: None,
+                    alert_drop_pct: None,
+                    alert_price: None,
+                });
+                rank_rows.push(core::RankRow {
+                    symbol: s.symbol.clone(),
+                    short_score: s.short_score,
+                    pct: s.pct,
+                    mcap_rank: mcap::rank_of(&ranks, &s.symbol),
+                    premium: s.premium,
+                    peak_gap_pct: s.peak_gap_pct,
+                    dist_high_pct: s.dist_high_pct,
+                    atr_expansion: s.atr_expansion,
+                    atr_pct: s.atr_pct,
+                    bear_5m: s.bear_5m,
+                });
+            }
+            _ => skipped.push(s.symbol.clone()),
         }
     }
     let wl = WatchList {
@@ -444,6 +511,7 @@ fn refresh_watchlist(prices_now: &HashMap<String, f64>) -> Option<WatchList> {
         wl.skipped_no_price.len(),
         wl.symbols.iter().take(3).map(|s| s.symbol.clone()).collect::<Vec<_>>()
     ));
+    maybe_push_rank_card(&rank_rows);
     Some(wl)
 }
 
@@ -475,6 +543,45 @@ fn post_feishu(payload: &Value) -> (i32, String) {
         Err(ureq::Error::Status(code, r)) => (code as i32, r.into_string().unwrap_or_default()),
         Err(e) => (-1, e.to_string()),
     }
+}
+
+fn maybe_push_rank_card(rows: &[core::RankRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let hour = shanghai_hour_key();
+    let last = load_last_rank_hour();
+    if !core::should_send_rank(last.as_deref(), &hour) {
+        log_line(&format!("RANK skip already pushed hour={hour}"));
+        return;
+    }
+    let now_hm = shanghai_now_hm();
+    let body = core::format_rank_md(rows, &now_hm);
+    let title = core::rank_feishu_card_title(&now_hm);
+    // Record the hour even in shadow mode so a restart does not re-emit.
+    save_last_rank_hour(&hour);
+    if !push_rank_feishu_enabled() {
+        // Keep the shadow log readable: one line with title, then the body.
+        log_line(&format!("SHADOW rank card title={title} chars={}", body.chars().count()));
+        for line in body.lines() {
+            log_line(&format!("SHADOW rank | {line}"));
+        }
+        return;
+    }
+    let payload = json!({
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": true},
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": "red"},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": body}}],
+        }
+    });
+    let (code, resp) = post_feishu(&payload);
+    log_line(&format!(
+        "RANK pushed hour={hour} feishu_http={} resp={}",
+        code,
+        &resp.chars().take(120).collect::<String>()
+    ));
 }
 
 fn send_dump_alert(row: &SymRow, current: f64, drop_pct: f64, threshold: f64) {
@@ -553,8 +660,9 @@ fn check_once(wl: &mut WatchList) {
 
 fn main() {
     log_line(&format!(
-        "START short_drop_monitor push_feishu={} dir={:?}",
+        "START short_drop_monitor push_feishu={} push_rank_feishu={} dir={:?}",
         push_feishu_enabled(),
+        push_rank_feishu_enabled(),
         data_dir()
     ));
     let mut last_refresh = 0.0f64;

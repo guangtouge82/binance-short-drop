@@ -298,5 +298,194 @@ pub fn feishu_card_title(now_str: &str) -> String {
     format!("暴跌告警 · {now_str}")
 }
 
+
+/// One row of the hourly short-rank Feishu card. Fields are whatever the
+/// simplified VPS scorer can compute; the layout mirrors short_rank.format_md.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankRow {
+    pub symbol: String,
+    pub short_score: i32,
+    pub pct: f64,
+    pub mcap_rank: Option<i64>,
+    pub premium: f64,
+    pub peak_gap_pct: f64,
+    pub dist_high_pct: f64,
+    pub atr_expansion: f64,
+    pub atr_pct: f64,
+    pub bear_5m: bool,
+}
+
+/// Binance USD-M futures deep link used in the original card.
+pub fn futures_link(symbol: &str) -> String {
+    format!("https://www.binance.com/zh-CN/futures/{symbol}")
+}
+
+pub fn mcap_label(rank: Option<i64>) -> String {
+    match rank {
+        Some(r) => format!("市值#{r}"),
+        None => "市值排名未知".into(),
+    }
+}
+
+/// Approximate the original plan_for tiers with the simplified score inputs.
+pub fn plan_label(score: i32, pct: f64, peak_gap: f64, atr_ok: bool, near_high: bool) -> String {
+    let true_dt = peak_gap > 0.0 && peak_gap <= 0.8;
+    let hot = pct >= 10.0;
+    let mid = (5.0..10.0).contains(&pct);
+    if pct < 5.0 {
+        if score >= 35 && true_dt {
+            return "顶部观察·等5m空".into();
+        }
+        return "观望".into();
+    }
+    let front_ok = atr_ok && near_high;
+    if score >= 55 && true_dt && hot && front_ok {
+        return "最优先摸顶空·可加仓".into();
+    }
+    if score >= 48 && true_dt && hot && front_ok {
+        return "摸顶做空".into();
+    }
+    if score >= 48 && true_dt && hot {
+        return "顶部观察·等5m空".into();
+    }
+    if score >= 45 && true_dt && mid {
+        return "顶部观察·等5m空".into();
+    }
+    if score >= 40 && hot {
+        return "顶部观察·等5m空".into();
+    }
+    if score >= 35 && pct >= 8.0 && near_high {
+        return "顶部观察·等5m空".into();
+    }
+    if score >= 30 {
+        return "弱续空".into();
+    }
+    "观望".into()
+}
+
+fn dt_label(gap: f64) -> String {
+    if gap <= 0.0 {
+        return "无明显双顶".into();
+    }
+    if gap <= 0.8 {
+        format!("两峰价差{gap:.2}%·真双顶")
+    } else if gap <= 2.0 {
+        format!("弱双顶两峰价差{gap:.2}%")
+    } else {
+        format!("非真双顶两峰价差{gap:.2}%")
+    }
+}
+
+/// Compact reason line built from the simplified signals.
+pub fn reason_line(r: &RankRow) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(dt_label(r.peak_gap_pct));
+    if r.premium >= 50.0 {
+        parts.push(format!("Premium{:.0}%", r.premium));
+    } else {
+        parts.push(format!("Discount{:.0}%", r.premium));
+    }
+    if r.pct >= 25.0 {
+        parts.push(format!("24h猛涨{:+.1}%", r.pct));
+    } else if r.pct >= 10.0 {
+        parts.push(format!("24h大涨{:+.1}%", r.pct));
+    } else if r.pct >= 5.0 {
+        parts.push(format!("24h涨幅中等{:+.1}%·权重减半", r.pct));
+    } else {
+        parts.push(format!("24h涨幅不足{:+.1}%·大幅降权", r.pct));
+    }
+    if r.dist_high_pct <= 3.0 {
+        parts.push(format!("距高点{:.2}%·充分", r.dist_high_pct));
+    } else if r.dist_high_pct <= 8.0 {
+        parts.push(format!("距高点{:.2}%·权重减半", r.dist_high_pct));
+    } else {
+        parts.push(format!("距高点{:.2}%·大幅降权", r.dist_high_pct));
+    }
+    if r.atr_expansion >= 50.0 {
+        parts.push(format!("ATR扩张{:.0}%·ATR%{:.2}", r.atr_expansion, r.atr_pct));
+    } else if r.atr_expansion >= 20.0 {
+        parts.push(format!("ATR扩张{:.0}%·权重减半·ATR%{:.2}", r.atr_expansion, r.atr_pct));
+    } else {
+        parts.push(format!("ATR扩张不足{:.0}%·大幅降权·ATR%{:.2}", r.atr_expansion, r.atr_pct));
+    }
+    if r.bear_5m {
+        parts.push("5m空头结构".into());
+    } else {
+        parts.push("5m仍偏多结构".into());
+    }
+    parts.join("；")
+}
+
+fn lead_extra(r: &RankRow) -> String {
+    let mut s = dt_label(r.peak_gap_pct);
+    s.push_str(&format!("；ATR扩张{:.0}%·ATR%{:.2}", r.atr_expansion, r.atr_pct));
+    s.push_str(&format!("；距高点{:.2}%", r.dist_high_pct));
+    s
+}
+
+/// Lark-md body of the hourly short-rank card. Mirrors short_rank.format_md.
+pub fn format_rank_md(rows: &[RankRow], now_str: &str) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let top = &rows[0];
+    let link = futures_link(&top.symbol);
+    let mut lines: Vec<String> = Vec::new();
+    let pct_top = format!("{:+.2}%", top.pct);
+    lines.push(format!(
+        "现在最该做空的是 [{sym}]({link})（做空分 **{score}**，24h {pct}，{mcap}）——{extra}；{reason}",
+        sym = top.symbol,
+        score = top.short_score,
+        pct = pct_top,
+        mcap = mcap_label(top.mcap_rank),
+        extra = lead_extra(top),
+        reason = reason_line(top),
+    ));
+    if top.short_score < 45 {
+        lines.push(format!(
+            "\n> 注：当前最高分 {} 不算很高，以上为相对最优，非强信号。",
+            top.short_score
+        ));
+    }
+    lines.push("\n## 做空分排序\n".into());
+    for (i, r) in rows.iter().enumerate() {
+        let atr_ok = r.atr_expansion >= 50.0;
+        let near = r.dist_high_pct <= 3.0;
+        let plan = plan_label(r.short_score, r.pct, r.peak_gap_pct, atr_ok, near);
+        let top_disp = format!("{:.0}", r.premium);
+        let m5_disp = if r.bear_5m { "空" } else { "多" };
+        let pct_s = format!("{:+.2}%", r.pct);
+        lines.push(format!(
+            "{idx}. **{score}分** [{sym}]({link}) {pct}｜{mcap}｜顶显{top}/5m{m5}｜**{plan}**｜{reason}",
+            idx = i + 1,
+            score = r.short_score,
+            sym = r.symbol,
+            link = futures_link(&r.symbol),
+            pct = pct_s,
+            mcap = mcap_label(r.mcap_rank),
+            top = top_disp,
+            m5 = m5_disp,
+            plan = plan,
+            reason = reason_line(r),
+        ));
+    }
+    lines.push(
+        "\n_规则：主池涨幅榜；≥10%正常、5–10%权重减半、<5%/负涨幅降权不进摸顶前列。真双顶=两峰价差≤0.8%且未破前高；弱0.8–2%；>2%或破前高=非真双顶。1h ATR(14)扩张≥50%充分加分、20–50%减半、<20%/相对偏低大幅降权不进最优先。现价距近期高点≤3%充分、3–8%减半、>8%大幅降权不进最优先。前排优先：高涨幅+真双顶+ATR扩张≥50%+贴近高点。市值排名查不到（CoinGecko无匹配）直接不进榜。数据币安U本位 {now}（上海）_".replace("{now}", now_str),
+    );
+    lines.join("\n")
+}
+
+pub fn rank_feishu_card_title(now_str: &str) -> String {
+    format!("做空优先级排序 · {now_str}")
+}
+
+/// True when this Shanghai hour has not yet been pushed (restart-safe).
+pub fn should_send_rank(last_hour_key: Option<&str>, current_hour_key: &str) -> bool {
+    match last_hour_key {
+        None => true,
+        Some(h) => h != current_hour_key,
+    }
+}
+
 #[cfg(test)]
 mod tests;

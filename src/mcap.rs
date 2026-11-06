@@ -188,6 +188,11 @@ pub fn is_listed(ranks: &HashMap<String, i64>, symbol: &str) -> bool {
 }
 
 
+/// Market-cap rank of the symbol's base coin, if listed.
+pub fn rank_of(ranks: &HashMap<String, i64>, symbol: &str) -> Option<i64> {
+    ranks.get(&base_of(symbol)).copied()
+}
+
 /// Stock / leveraged-ETF tokens that trade as USDT perpetuals but are not
 /// crypto. Used as a fallback filter when the CoinGecko list cannot be
 /// fetched, so the monitor never collapses to an empty list just because the

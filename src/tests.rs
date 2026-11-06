@@ -176,3 +176,71 @@ fn feishu_card_body_without_score() {
     let body = feishu_card_body("XUSDT", None, 1.0, 0.8, 20.0, "t", 10.0);
     assert!(!body.contains("做空分"));
 }
+
+fn sample_row(sym: &str, score: i32, pct: f64) -> RankRow {
+    RankRow {
+        symbol: sym.into(),
+        short_score: score,
+        pct,
+        mcap_rank: Some(100),
+        premium: 80.0,
+        peak_gap_pct: 0.3,
+        dist_high_pct: 1.2,
+        atr_expansion: 60.0,
+        atr_pct: 3.5,
+        bear_5m: true,
+    }
+}
+
+#[test]
+fn rank_card_title_and_body() {
+    let rows = vec![
+        sample_row("LYNUSDT", 93, 9.88),
+        sample_row("BTWUSDT", 87, 11.15),
+    ];
+    let md = format_rank_md(&rows, "2026-11-06 10:00");
+    assert!(md.contains("现在最该做空的是 [LYNUSDT]"));
+    assert!(md.contains("做空分 **93**"));
+    assert!(md.contains("## 做空分排序"));
+    assert!(md.contains("1. **93分** [LYNUSDT]"));
+    assert!(md.contains("2. **87分** [BTWUSDT]"));
+    assert!(md.contains("市值#100"));
+    assert!(md.contains("binance.com/zh-CN/futures/LYNUSDT"));
+    assert!(md.contains("数据币安U本位 2026-11-06 10:00（上海）"));
+    let title = rank_feishu_card_title("2026-11-06 10:00");
+    assert_eq!(title, "做空优先级排序 · 2026-11-06 10:00");
+}
+
+#[test]
+fn rank_card_empty_is_empty() {
+    assert!(format_rank_md(&[], "t").is_empty());
+}
+
+#[test]
+fn rank_card_low_score_note() {
+    let rows = vec![sample_row("XUSDT", 30, 4.0)];
+    let md = format_rank_md(&rows, "t");
+    assert!(md.contains("不算很高"));
+}
+
+#[test]
+fn plan_label_tiers() {
+    assert_eq!(plan_label(60, 15.0, 0.4, true, true), "最优先摸顶空·可加仓");
+    assert_eq!(plan_label(50, 15.0, 0.4, true, true), "摸顶做空");
+    assert_eq!(plan_label(50, 15.0, 0.4, false, true), "顶部观察·等5m空");
+    assert_eq!(plan_label(25, 6.0, 1.5, false, false), "观望");
+    assert_eq!(plan_label(32, 12.0, 3.0, false, false), "弱续空");
+}
+
+#[test]
+fn should_send_rank_once_per_hour() {
+    assert!(should_send_rank(None, "2026-11-06-10"));
+    assert!(should_send_rank(Some("2026-11-06-09"), "2026-11-06-10"));
+    assert!(!should_send_rank(Some("2026-11-06-10"), "2026-11-06-10"));
+}
+
+#[test]
+fn mcap_label_known_and_unknown() {
+    assert_eq!(mcap_label(Some(55)), "市值#55");
+    assert_eq!(mcap_label(None), "市值排名未知");
+}
